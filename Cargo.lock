@@ -6439,6 +6439,7 @@ dependencies = [
  "lance-context-metrics",
  "lru",
  "metrics",
+ "metrics-util",
  "serde",
  "serde_json",
  "tempfile",

@@ -88,6 +88,45 @@ fn flush_requested(query: Option<&str>) -> bool {
     })
 }
 
+/// Whether a blob of `len` bytes crosses the large-blob log threshold.
+///
+/// Split out from [`observe_blob_sizes`] so the boundary is testable without a
+/// tracing-capture harness: `0` disables, and the comparison is inclusive so a
+/// blob exactly at the threshold logs.
+fn should_log_large_blob(len: usize, threshold: usize) -> bool {
+    threshold > 0 && len >= threshold
+}
+
+/// Record the size of every inline artifact blob in `records`, and warn for any
+/// that crosses `ROLLOUT_LARGE_BLOB_LOG_BYTES`.
+///
+/// Called once after parsing, where the multipart and JSON paths converge, so
+/// both content types are covered by a single site: a record can arrive with
+/// `binary_payload` already populated from an inline-JSON body, never passing
+/// through the multipart blob loop.
+///
+/// The histogram is deliberately unlabelled. Tagging by experiment would be the
+/// more useful signal, but a deployment can carry thousands of experiments and
+/// each label value is a separate time series; the warn log supplies the
+/// identifying detail for the outliers that actually matter instead.
+fn observe_blob_sizes(state: &AppState, experiment: &str, records: &[AddRolloutRequest]) {
+    let threshold = state.rollout_large_blob_log_bytes;
+    for record in records {
+        let Some(payload) = record.binary_payload.as_ref() else {
+            continue;
+        };
+        metrics::histogram!("rollout_blob_bytes").record(payload.len() as f64);
+        if should_log_large_blob(payload.len(), threshold) {
+            tracing::warn!(
+                experiment = %experiment,
+                record_id = %record.id,
+                blob_bytes = payload.len(),
+                "large inline blob written"
+            );
+        }
+    }
+}
+
 /// Reserve `bytes` from the instance's in-flight blob budget (if configured),
 /// returning the RAII guard to hold for the request's duration. Returns
 /// `503 Overloaded` when the budget cannot currently admit the request. When no
@@ -295,6 +334,8 @@ pub async fn add_rollouts(
             "records array must not be empty".to_string(),
         ));
     }
+
+    observe_blob_sizes(&state, &name, &records);
 
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
@@ -789,6 +830,68 @@ mod tests {
         assert_eq!(content_length(&headers), 0);
         headers.insert(header::CONTENT_LENGTH, header::HeaderValue::from(4096));
         assert_eq!(content_length(&headers), 4096);
+    }
+
+    /// The threshold is inclusive and `0` disables the log entirely, so an
+    /// operator who leaves the knob unset is never spammed.
+    #[test]
+    fn large_blob_log_threshold_is_inclusive_and_zero_disables() {
+        assert!(!should_log_large_blob(1023, 1024));
+        assert!(should_log_large_blob(1024, 1024), "threshold is inclusive");
+        assert!(should_log_large_blob(4096, 1024));
+        // Disabled: not even an enormous blob logs.
+        assert!(!should_log_large_blob(usize::MAX, 0));
+    }
+
+    /// Every inline blob is measured, including one supplied through the
+    /// inline-JSON path rather than a multipart part.
+    ///
+    /// This is why the instrumentation sits after the two parse paths converge
+    /// instead of inside the multipart blob loop: a JSON body populates
+    /// `binary_payload` directly and never enters that loop, so instrumenting
+    /// there would silently miss it.
+    #[tokio::test]
+    async fn blob_sizes_are_recorded_for_records_with_payloads() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::MetricKind;
+
+        let dir = TempDir::new().unwrap();
+        let state = AppState::new_for_test(dir.path().to_path_buf()).await;
+
+        let record = |id: &str, payload: Option<Vec<u8>>| AddRolloutRequest {
+            id: id.to_string(),
+            binary_payload: payload,
+            ..Default::default()
+        };
+        let records = vec![
+            record("with-blob", Some(vec![0u8; 512])),
+            record("no-blob", None),
+            record("bigger-blob", Some(vec![0u8; 2048])),
+        ];
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            observe_blob_sizes(&state, "exp", &records);
+        });
+
+        let samples = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, value)| {
+                (key.kind() == MetricKind::Histogram && key.key().name() == "rollout_blob_bytes")
+                    .then_some(value)
+            })
+            .expect("rollout_blob_bytes histogram must be emitted");
+
+        let DebugValue::Histogram(values) = samples else {
+            panic!("rollout_blob_bytes must be a histogram");
+        };
+        let mut observed: Vec<f64> = values.into_iter().map(|v| v.into_inner()).collect();
+        observed.sort_by(f64::total_cmp);
+        // The payload-less record contributes nothing: two samples, not three.
+        assert_eq!(observed, vec![512.0, 2048.0]);
     }
 
     async fn rollout_state() -> (Arc<AppState>, TempDir) {

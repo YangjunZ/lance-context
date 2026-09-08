@@ -76,6 +76,9 @@ pub struct AppState {
     /// uploads/downloads. `None` disables the budget (unbounded). See
     /// [`BlobBudget`].
     pub blob_budget: Option<Arc<BlobBudget>>,
+    /// Byte size at or above which a single inline blob is logged at `WARN`.
+    /// `0` disables the log. See `Config::rollout_large_blob_log_bytes`.
+    pub rollout_large_blob_log_bytes: usize,
     /// Shared Lance cache session attached to every resident rollout store, so
     /// the process's total metadata/index cache is bounded by one budget rather
     /// than Lance's default 6 GiB *per store*. `None` restores the per-store
@@ -232,6 +235,7 @@ impl AppState {
             rollout_cleanup_interval_secs: config.rollout_cleanup_interval_secs,
             rollout_flush_interval_secs: config.rollout_flush_interval_secs,
             blob_budget,
+            rollout_large_blob_log_bytes: config.rollout_large_blob_log_bytes,
             rollout_session,
             datagen_stores: Mutex::new(LruCache::new(capacity)),
             datagen_registry: RwLock::new(datagen_registry),
@@ -292,6 +296,7 @@ impl AppState {
             rollout_cleanup_interval_secs: 0,
             rollout_flush_interval_secs: 0,
             blob_budget: None,
+            rollout_large_blob_log_bytes: 16 * 1024 * 1024,
             rollout_session: build_rollout_session(2 * 1024 * 1024 * 1024),
             generic_stores: Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),

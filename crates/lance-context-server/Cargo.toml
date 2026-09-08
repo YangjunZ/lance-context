@@ -32,4 +32,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+# Snapshotting recorder so tests can assert which metric series an operation
+# emitted, without installing a process-global Prometheus exporter.
+metrics-util = { version = "0.19", default-features = false, features = [
+    "debugging",
+] }
 tempfile = "3"

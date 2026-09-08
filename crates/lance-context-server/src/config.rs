@@ -125,6 +125,21 @@ pub struct ServerConfig {
     #[arg(long, env = "ROLLOUT_MAX_INFLIGHT_BLOB_BYTES", default_value = "0")]
     pub rollout_max_inflight_blob_bytes: usize,
 
+    /// Size, in bytes, at or above which a single inline artifact blob is
+    /// logged at `WARN` with its experiment and record id.
+    ///
+    /// Blob size drives memory pressure on both the worker (WAL merge buffers
+    /// flushed generations, and every resident store keeps its manifest) and
+    /// the master (the compaction rewrite buffer). The `rollout_blob_bytes`
+    /// histogram shows the *distribution* but not which experiment produced an
+    /// outlier; thousands of experiments make a per-experiment histogram label
+    /// too high-cardinality to carry by default. This log closes that gap: the
+    /// histogram says a large blob was written, and the log says who wrote it.
+    ///
+    /// `0` disables the log; the histogram is always emitted.
+    #[arg(long, env = "ROLLOUT_LARGE_BLOB_LOG_BYTES", default_value = "16777216")]
+    pub rollout_large_blob_log_bytes: usize,
+
     /// Total byte budget for the Lance metadata/index caches, shared across
     /// **all** resident rollout stores on this instance.
     ///
