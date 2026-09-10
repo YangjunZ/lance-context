@@ -36,15 +36,19 @@ use uuid::Uuid;
 use crate::record::{
     ContextRecord, LifecycleQueryOptions, RecordFilters, RecordPatch, Relationship, RetrieveResult,
     SearchResult, StateMetadata, UpdateResult, UpsertResult, LIFECYCLE_ACTIVE,
+    LIFECYCLE_CONTRADICTED,
 };
 use crate::serde::CONTENT_TYPE_TOMBSTONE;
-use crate::store_base::{StorageBase, StorageBaseOptions};
+use crate::store_base::{ListSource, StorageBase, StorageBaseOptions};
 
 /// Embedding length used for the semantic index column.
 const DEFAULT_EMBEDDING_DIM: i32 = 1536;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const RRF_K: f32 = 60.0;
 const ID_INDEX_NAME: &str = "id_idx";
+/// Bound candidate bookkeeping and each supersession predicate independently
+/// of the number of historical records sharing an external id.
+const POINT_READ_BATCH_SIZE: usize = 256;
 pub(crate) const RELATIONSHIPS_COLUMN: &str = "relationships";
 /// Schema-metadata key under which the configured [`DistanceMetric`] is persisted
 /// so it round-trips on `open` without being re-specified by the caller.
@@ -710,7 +714,7 @@ impl ContextStore {
     // TODO(#115): offer a signed-URL variant (`fetch_payload_url`) where the
     // backend supports presigning, instead of always streaming the bytes back.
     pub async fn fetch_payload(&self, id: &str) -> LanceResult<Option<Vec<u8>>> {
-        // Use the list-backed accessor so freshly written (MemWAL-buffered) rows
+        // Use the LSM-backed accessor so freshly written (MemWAL-buffered) rows
         // and lifecycle visibility are handled exactly like every other read.
         let Some(record) = self.get_by_id(id).await? else {
             return Ok(None);
@@ -1069,10 +1073,8 @@ impl ContextStore {
             .into());
         }
         let Some(existing) = self
-            .list_with_all_payloads()
+            .visible_record_by_key("id", id, ReadProjection::default(), false)
             .await?
-            .into_iter()
-            .find(|record| record.id == id)
         else {
             return Ok(None);
         };
@@ -1094,25 +1096,13 @@ impl ContextStore {
             .into());
         }
 
-        let matches: Vec<ContextRecord> = self
-            .list_with_all_payloads()
+        let Some(existing) = self
+            .visible_record_by_key("external_id", external_id, ReadProjection::default(), true)
             .await?
-            .into_iter()
-            .filter(|existing| existing.external_id.as_deref() == Some(external_id))
-            .collect();
-
-        match matches.as_slice() {
-            [] => Ok(None),
-            [existing] => self
-                .update_visible_record(existing.clone(), patch)
-                .await
-                .map(Some),
-            _ => Err(ArrowError::InvalidArgumentError(format!(
-                "external_id '{}' matches multiple visible records",
-                external_id
-            ))
-            .into()),
-        }
+        else {
+            return Ok(None);
+        };
+        self.update_visible_record(existing, patch).await.map(Some)
     }
 
     async fn update_visible_record(
@@ -1127,11 +1117,12 @@ impl ContextStore {
             .into());
         }
 
-        let mut record = existing.clone();
+        let replaced_id = existing.id.clone();
+        let mut record = existing;
         record.id = Uuid::new_v4().to_string();
         record.run_id = Uuid::new_v4().to_string();
         record.created_at = Utc::now();
-        record.supersedes_id = Some(existing.id.clone());
+        record.supersedes_id = Some(replaced_id.clone());
         record.superseded_by_id = None;
 
         if let Some(bot_id) = patch.bot_id {
@@ -1187,7 +1178,7 @@ impl ContextStore {
         let version = self.write_entries(std::slice::from_ref(&record)).await?;
         Ok(UpdateResult {
             record,
-            replaced_id: existing.id,
+            replaced_id,
             version,
         })
     }
@@ -1498,19 +1489,6 @@ impl ContextStore {
         .await
     }
 
-    /// Internal mutation reads must preserve payloads that are not being
-    /// patched. Public/default reads can leave configured blob columns lazy.
-    async fn list_with_all_payloads(&self) -> LanceResult<Vec<ContextRecord>> {
-        self.list_filtered_projected(
-            None,
-            None,
-            None,
-            LifecycleQueryOptions::default(),
-            ReadProjection::default(),
-        )
-        .await
-    }
-
     /// Like [`Self::list_filtered_with_options`] but with column projection, so
     /// large payload columns can be skipped (see [`ReadProjection`]). Omitted
     /// payloads come back as `None`; fetch bytes on demand via
@@ -1568,11 +1546,8 @@ impl ContextStore {
     /// blobs remain lazy and come back as `None`; use [`Self::get_blob`] or an
     /// explicit projected read to materialize them.
     pub async fn get_by_id(&self, id: &str) -> LanceResult<Option<ContextRecord>> {
-        Ok(self
-            .list(None, None)
-            .await?
-            .into_iter()
-            .find(|record| record.id == id))
+        self.visible_record_by_key("id", id, self.default_read_projection(), false)
+            .await
     }
 
     /// Find a record by its caller-supplied external id.
@@ -1580,11 +1555,123 @@ impl ContextStore {
         &self,
         external_id: &str,
     ) -> LanceResult<Option<ContextRecord>> {
-        Ok(self
-            .list(None, None)
-            .await?
-            .into_iter()
-            .find(|record| record.external_id.as_deref() == Some(external_id)))
+        self.visible_record_by_key(
+            "external_id",
+            external_id,
+            self.default_read_projection(),
+            false,
+        )
+        .await
+    }
+
+    /// Stream only identity/lifecycle columns, resolving supersession in bounded
+    /// chunks. Retain one winning identity and fetch its payload only after the
+    /// scan (and, for updates, the uniqueness check) is complete. `column` is an
+    /// internal schema column; caller-provided values must be SQL-escaped.
+    async fn visible_record_by_key(
+        &self,
+        column: &str,
+        value: &str,
+        projection: ReadProjection,
+        require_unique: bool,
+    ) -> LanceResult<Option<ContextRecord>> {
+        // Older contexts may predate external ids and lifecycle columns.
+        if column == "external_id" && !self.has_external_id_column() {
+            return Ok(None);
+        }
+        let filter = format!("{column} IN ({})", sql_quoted_list(&[value]));
+        // Keep all scans on the same WAL view, so a concurrent replacement
+        // cannot hide a candidate without also being eligible for selection.
+        let snapshots = self.base.wal_shard_snapshots().await?;
+        let columns: Vec<&str> = [
+            "id",
+            "created_at",
+            "content_type",
+            "expires_at",
+            "lifecycle_status",
+            "retired_at",
+            "superseded_by_id",
+        ]
+        .into_iter()
+        .filter(|name| self.base.dataset.schema().field(name).is_some())
+        .collect();
+        let scanner = self
+            .base
+            .lsm_scanner_for_source(ListSource::All, snapshots.clone())
+            .project(&columns)?
+            .filter(&filter)?;
+        let mut stream = scanner.try_into_stream().await?;
+        let reference_time = Utc::now();
+        let mut selected: Option<(DateTime<Utc>, String)> = None;
+        while let Some(batch) = stream.try_next().await? {
+            // Arrow may deliver a larger batch; never convert/retain all its
+            // rows or collect batches into a growing Vec of ContextRecords.
+            for start in (0..batch.num_rows()).step_by(POINT_READ_BATCH_SIZE) {
+                let chunk = batch.slice(start, POINT_READ_BATCH_SIZE.min(batch.num_rows() - start));
+                let candidates = point_read_candidates(&chunk, reference_time)?;
+                if candidates.is_empty() {
+                    continue;
+                }
+                let mut live_ids: HashSet<&str> =
+                    candidates.iter().map(|(_, id)| id.as_str()).collect();
+                if self.base.dataset.schema().field("supersedes_id").is_some() {
+                    // A successor has a different id and can even have a different
+                    // external_id. Check references outside the candidate set, including
+                    // hidden successors, without reading any of their payload columns.
+                    let ids: Vec<&str> = live_ids.iter().copied().collect();
+                    let filter = format!("supersedes_id IN ({})", sql_quoted_list(&ids));
+                    let scanner = self
+                        .base
+                        .lsm_scanner_for_source(ListSource::All, snapshots.clone())
+                        .project(&["id", "supersedes_id"])?
+                        .filter(&filter)?;
+                    let mut stream = scanner.try_into_stream().await?;
+                    while let Some(batch) = stream.try_next().await? {
+                        let ids = column_as::<StringArray>(&batch, "id")?;
+                        let supersedes = column_as::<StringArray>(&batch, "supersedes_id")?;
+                        for row in 0..batch.num_rows() {
+                            if !supersedes.is_null(row) && supersedes.value(row) != ids.value(row) {
+                                live_ids.remove(supersedes.value(row));
+                            }
+                        }
+                        if live_ids.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                for candidate in &candidates {
+                    if !live_ids.contains(candidate.1.as_str()) {
+                        continue;
+                    }
+                    if require_unique && selected.is_some() {
+                        return Err(ArrowError::InvalidArgumentError(format!(
+                            "external_id '{}' matches multiple visible records",
+                            value
+                        ))
+                        .into());
+                    }
+                    // Match list's (created_at, id) ordering across all chunks.
+                    if selected.as_ref().is_none_or(|current| candidate < current) {
+                        selected = Some(candidate.clone());
+                    }
+                }
+            }
+        }
+        let Some((_, id)) = selected else {
+            return Ok(None);
+        };
+        let scanner = self
+            .base
+            .lsm_scanner_for_source(ListSource::All, snapshots)
+            .project(&self.projected_columns(projection))?
+            .filter(&format!("id IN ({})", sql_quoted_list(&[&id])))?;
+        let mut stream = scanner.try_into_stream().await?;
+        while let Some(batch) = stream.try_next().await? {
+            if batch.num_rows() > 0 {
+                return Ok(batch_to_records(&batch)?.into_iter().next());
+            }
+        }
+        Ok(None)
     }
 
     /// List records that have a relationship targeting `target_id`.
@@ -2730,6 +2817,45 @@ impl Drop for ContextStore {
             }
         }
     }
+}
+
+/// Decode only the fields needed for default lifecycle visibility and ordering.
+/// The caller passes at most POINT_READ_BATCH_SIZE rows. In particular, neither
+/// user metadata nor historical payloads are read during candidate selection.
+fn point_read_candidates(
+    batch: &RecordBatch,
+    reference_time: DateTime<Utc>,
+) -> LanceResult<Vec<(DateTime<Utc>, String)>> {
+    let ids = column_as::<StringArray>(batch, "id")?;
+    let created_at = column_as::<TimestampMicrosecondArray>(batch, "created_at")?;
+    let content_type = column_as::<StringArray>(batch, "content_type")?;
+    let expires_at = column_as_optional::<TimestampMicrosecondArray>(batch, "expires_at");
+    let lifecycle_status = column_as_optional::<StringArray>(batch, "lifecycle_status");
+    let retired_at = column_as_optional::<TimestampMicrosecondArray>(batch, "retired_at");
+    let superseded_by_id = column_as_optional::<StringArray>(batch, "superseded_by_id");
+    let mut candidates = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let status = lifecycle_status
+            .filter(|array| !array.is_null(row))
+            .map(|array| array.value(row))
+            .unwrap_or(LIFECYCLE_ACTIVE);
+        // Same default visibility as LifecycleQueryOptions::is_visible, without
+        // constructing a ContextRecord (which would load unrelated fields).
+        if content_type.value(row) == CONTENT_TYPE_TOMBSTONE
+            || optional_timestamp_from_array(expires_at, row, "expires_at")?
+                .is_some_and(|expires_at| expires_at <= reference_time)
+            || !matches!(status, LIFECYCLE_ACTIVE | LIFECYCLE_CONTRADICTED)
+            || retired_at.is_some_and(|array| !array.is_null(row))
+            || superseded_by_id.is_some_and(|array| !array.is_null(row))
+        {
+            continue;
+        }
+        candidates.push((
+            timestamp_from_micros(created_at.value(row), "created_at")?,
+            ids.value(row).to_string(),
+        ));
+    }
+    Ok(candidates)
 }
 
 /// Convert a record batch to context records.
@@ -3965,6 +4091,337 @@ mod tests {
 
             let missing = store.get_by_external_id("missing").await.unwrap();
             assert!(missing.is_none());
+        });
+    }
+
+    #[test]
+    fn point_reads_preserve_visibility_across_wal_and_base() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let mut records: Vec<_> = [
+                "quoted'id",
+                "expired",
+                "retired",
+                "replaced",
+                "successor",
+                "self",
+                "deleted",
+                "contradicted",
+                "hidden-status",
+                "hidden-pointer",
+            ]
+            .into_iter()
+            .map(|id| upsert_record(id, &format!("ext-{id}"), 0.0))
+            .collect();
+            records[1].expires_at = Some(Utc::now() - ChronoDuration::hours(1));
+            records[2].retired_at = Some(Utc::now());
+            // Even an expired successor with a different external id hides its
+            // predecessor. Self-references must not hide an otherwise live row.
+            records[4].supersedes_id = Some("replaced".to_string());
+            records[4].expires_at = records[1].expires_at;
+            records[5].supersedes_id = Some("self".to_string());
+            records[7].lifecycle_status = LIFECYCLE_CONTRADICTED.to_string();
+            records[8].lifecycle_status = "retired".to_string();
+            records[9].superseded_by_id = Some("other".to_string());
+            store.add(&records).await.unwrap();
+            store.delete_by_id("deleted").await.unwrap();
+
+            for merged in [false, true] {
+                if merged {
+                    store.cleanup_wal().await.unwrap();
+                }
+                let visible = store.list(None, None).await.unwrap();
+                assert_eq!(visible.len(), 3);
+                for record in &records {
+                    let expected = visible.iter().find(|r| r.id == record.id);
+                    assert_eq!(
+                        store.get_by_id(&record.id).await.unwrap().map(|r| r.id),
+                        expected.map(|r| r.id.clone())
+                    );
+                    assert_eq!(
+                        store
+                            .get_by_external_id(record.external_id.as_deref().unwrap())
+                            .await
+                            .unwrap()
+                            .map(|r| r.id),
+                        expected.map(|r| r.id.clone())
+                    );
+                    if expected.is_none() {
+                        let patch = RecordPatch {
+                            source: Some("patch".to_string()),
+                            ..Default::default()
+                        };
+                        assert!(store
+                            .update_by_id(&record.id, patch.clone())
+                            .await
+                            .unwrap()
+                            .is_none());
+                        assert!(store
+                            .update_by_external_id(record.external_id.as_deref().unwrap(), patch)
+                            .await
+                            .unwrap()
+                            .is_none());
+                    }
+                }
+                assert!(store.get_by_id("' OR true --").await.unwrap().is_none());
+                assert!(store
+                    .get_by_external_id("' OR true --")
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn point_reads_do_not_decode_unrelated_records() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut store = ContextStore::open_with_options(
+                &uri,
+                ContextStoreOptions {
+                    blob_columns: HashSet::from([
+                        "text_payload".to_string(),
+                        "binary_payload".to_string(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut target = upsert_record("target'id", "target'ext", 0.0);
+            target.binary_payload = Some(vec![1, 2, 3]);
+            let unrelated = text_record("unrelated", 0.0);
+            let batch = store
+                .records_to_batch(&[target.clone(), unrelated])
+                .unwrap();
+            let mut columns = batch.columns().to_vec();
+            // A full list would try to decode this unrelated row and fail.
+            // Both candidate and supersession scans must avoid doing so.
+            columns[batch.schema().index_of("metadata").unwrap()] =
+                Arc::new(LargeStringArray::from(vec![None, Some("invalid json")]));
+            let batch = RecordBatch::try_new(batch.schema(), columns).unwrap();
+            store.base.put(vec![batch]).await.unwrap();
+
+            for merged in [false, true] {
+                if merged {
+                    store.cleanup_wal().await.unwrap();
+                }
+                assert!(store
+                    .list(None, None)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid metadata JSON"));
+                for fetched in [
+                    store.get_by_id(&target.id).await.unwrap().unwrap(),
+                    store
+                        .get_by_external_id("target'ext")
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                ] {
+                    assert!(fetched.binary_payload.is_none());
+                    assert!(fetched.text_payload.is_none());
+                    assert_eq!(fetched.embedding, target.embedding);
+                }
+                assert!(store.get_by_id("missing").await.unwrap().is_none());
+                assert!(store.get_by_external_id("missing").await.unwrap().is_none());
+            }
+
+            let patch = RecordPatch {
+                source: Some("patched".to_string()),
+                ..Default::default()
+            };
+            let updated = store
+                .update_by_id(&target.id, patch.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(updated.record.text_payload, target.text_payload);
+            assert_eq!(updated.record.binary_payload, target.binary_payload);
+            assert_eq!(updated.record.embedding, target.embedding);
+            let updated = store
+                .update_by_external_id("target'ext", patch)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(updated.record.text_payload, target.text_payload);
+            assert_eq!(updated.record.binary_payload, target.binary_payload);
+            assert_eq!(updated.record.embedding, target.embedding);
+        });
+    }
+
+    #[test]
+    fn point_reads_stream_long_history_before_loading_the_winning_payload() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let count = POINT_READ_BATCH_SIZE * 2 + 7;
+            let mut history: Vec<_> = (0..count)
+                .map(|i| {
+                    let mut record = upsert_record(&format!("history-{i:04}"), "history", 0.0);
+                    record.binary_payload = Some(vec![42; 4096]);
+                    if i > 0 {
+                        record.supersedes_id = Some(format!("history-{:04}", i - 1));
+                    }
+                    record
+                })
+                .collect();
+            let winner = history.pop().unwrap();
+            // Older versions have unreadable user metadata. Selection must only
+            // scan lifecycle/identity columns, even though every external id
+            // matches. Spread history over generations and candidate chunks.
+            for records in history.chunks(POINT_READ_BATCH_SIZE + 1) {
+                let batch = store.records_to_batch(records).unwrap();
+                let mut columns = batch.columns().to_vec();
+                columns[batch.schema().index_of("metadata").unwrap()] =
+                    Arc::new(LargeStringArray::from(vec![
+                        Some(
+                            "invalid historical metadata"
+                        );
+                        records.len()
+                    ]));
+                store
+                    .base
+                    .put(vec![RecordBatch::try_new(batch.schema(), columns).unwrap()])
+                    .await
+                    .unwrap();
+            }
+            store
+                .write_entries(std::slice::from_ref(&winner))
+                .await
+                .unwrap();
+            for merged in [false, true] {
+                if merged {
+                    store.cleanup_wal().await.unwrap();
+                }
+                let fetched = store.get_by_external_id("history").await.unwrap().unwrap();
+                assert_eq!(fetched.id, winner.id);
+                assert_eq!(fetched.binary_payload, winner.binary_payload);
+                assert!(store.get_by_id("history-0000").await.unwrap().is_none());
+            }
+            let updated = store
+                .update_by_external_id(
+                    "history",
+                    RecordPatch {
+                        source: Some("patched".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(updated.replaced_id, winner.id);
+            assert_eq!(updated.record.binary_payload, winner.binary_payload);
+            assert_eq!(updated.record.text_payload, winner.text_payload);
+            assert_eq!(updated.record.embedding, winner.embedding);
+        });
+    }
+
+    #[test]
+    fn point_reads_preserve_ambiguous_external_id_behavior() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            let later = upsert_record("b", "duplicate", 0.0);
+            let mut earlier = upsert_record("a", "duplicate", 0.0);
+            earlier.created_at = later.created_at;
+            // Live records are separated by more than one candidate chunk, so
+            // ordering and ambiguity detection must work across chunks too.
+            let mut records = vec![later];
+            for i in 0..POINT_READ_BATCH_SIZE * 2 {
+                let mut hidden = upsert_record(&format!("expired-{i}"), "duplicate", 0.0);
+                hidden.expires_at = Some(Utc::now() - ChronoDuration::hours(1));
+                records.push(hidden);
+            }
+            records.push(earlier);
+            // Bypass uniqueness validation to model existing ambiguous data.
+            let batch = store.records_to_batch(&records).unwrap();
+            let mut columns = batch.columns().to_vec();
+            let mut metadata = vec![None; records.len()];
+            metadata[0] = Some("invalid metadata on the unselected live record");
+            columns[batch.schema().index_of("metadata").unwrap()] =
+                Arc::new(LargeStringArray::from(metadata));
+            store
+                .base
+                .put(vec![RecordBatch::try_new(batch.schema(), columns).unwrap()])
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_by_external_id("duplicate")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                "a"
+            );
+            let error = store
+                .update_by_external_id(
+                    "duplicate",
+                    RecordPatch {
+                        source: Some("patched".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("matches multiple visible records"));
+        });
+    }
+
+    #[test]
+    fn point_reads_support_legacy_schema() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let schema = Arc::new(ContextStore::schema_with_options(
+                &HashSet::new(),
+                false,
+                true,
+                true,
+                false,
+                true,
+                DEFAULT_EMBEDDING_DIM,
+                DistanceMetric::default(),
+            ));
+            let batch = RecordBatch::new_empty(schema.clone());
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok::<_, ArrowError>(batch)], schema),
+                &uri,
+                Some(WriteParams {
+                    mode: WriteMode::Create,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let mut store = ContextStore::open(&uri).await.unwrap();
+            store.add(&[text_record("legacy", 0.0)]).await.unwrap();
+            assert_eq!(
+                store.get_by_id("legacy").await.unwrap().unwrap().id,
+                "legacy"
+            );
+            assert!(store.get_by_external_id("missing").await.unwrap().is_none());
+            assert!(store
+                .update_by_external_id(
+                    "missing",
+                    RecordPatch {
+                        source: Some("patched".to_string()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()
+                .is_none());
         });
     }
 
