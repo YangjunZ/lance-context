@@ -37,26 +37,18 @@ pub struct ServerConfig {
     #[arg(long, env = "ROLLOUT_MERGE_AFTER_GENERATIONS", default_value = "0")]
     pub rollout_merge_after_generations: usize,
 
-    /// Maximum flushed MemWAL generations folded into the base table by a single
-    /// merge pass. `0` means unbounded (every pending generation at once).
-    ///
-    /// # Why this is capped
-    ///
-    /// A merge reads every row of every generation it takes into memory before
-    /// appending, and rollout rows carry `binary_payload` inline (blob-v2
-    /// offload reads back as `None` through the MemWAL scanner, so it cannot be
-    /// used). Peak memory for one pass is therefore the total artifact volume of
-    /// the generations it took. Unbounded, a worker draining a backlog
-    /// materialised multiple GiB at once; glibc frees that logically but retains
-    /// it in its arenas, so RSS ratcheted up a step per merge and workers were
-    /// eventually OOMKilled.
-    ///
-    /// Leftover generations are not dropped -- they stay pending and the next
-    /// pass takes them. This bounds *per-pass* memory, so it is the knob that
-    /// matters for RSS; `--rollout-merge-after-generations` only controls when
-    /// the count trigger fires, and the time-based cleanup ignores it entirely.
+    /// Maximum flushed MemWAL generations folded into the base table by one
+    /// merge pass. `0` disables this cap; the byte budget still applies.
+    /// Leftovers stay pending for the next pass. Both caps apply to count- and
+    /// time-triggered merges of rollout, datagen and generic stores.
     #[arg(long, env = "ROLLOUT_MERGE_MAX_GENERATIONS", default_value = "8")]
     pub rollout_merge_max_generations: usize,
+
+    /// Buffered Arrow array byte budget per merge pass; `0` disables this cap.
+    /// Checked after each whole generation, so one oversized generation
+    /// still makes progress. The generation-count cap applies independently.
+    #[arg(long, env = "ROLLOUT_MERGE_MAX_BYTES", default_value = "1073741824")]
+    pub rollout_merge_max_bytes: usize,
 
     /// Interval, in seconds, for the periodic per-shard WAL cleanup task. When
     /// non-zero, the global sweeper folds this instance's flushed MemWAL
@@ -220,7 +212,30 @@ mod tests {
     fn parses_with_only_a_data_dir() {
         let config = ServerConfig::try_parse_from(["lance-context-server", "--data-dir", "/tmp/x"])
             .expect("the documented minimal invocation must parse");
+        assert_eq!(config.rollout_merge_max_bytes, 1024 * 1024 * 1024);
         assert_eq!(config.rollout_flush_interval_secs, 30);
         assert_eq!(config.rollout_cleanup_interval_secs, 0);
+    }
+
+    #[test]
+    fn merge_byte_budget_flag_and_env_binding() {
+        let command = ServerConfig::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "rollout_merge_max_bytes")
+            .unwrap();
+        assert_eq!(arg.get_env().unwrap(), "ROLLOUT_MERGE_MAX_BYTES");
+        for (value, expected) in [("0", 0), ("1048576", 1048576)] {
+            let config = ServerConfig::try_parse_from([
+                "lance-context-server",
+                "--rollout-merge-max-bytes",
+                value,
+                "--rollout-merge-max-generations",
+                "3",
+            ])
+            .unwrap();
+            assert_eq!(config.rollout_merge_max_bytes, expected);
+            assert_eq!(config.rollout_merge_max_generations, 3);
+        }
     }
 }

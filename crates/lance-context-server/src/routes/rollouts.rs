@@ -180,6 +180,7 @@ pub async fn create_rollout_store(
         merge_after_generations: (state.rollout_merge_after_generations > 0)
             .then_some(state.rollout_merge_after_generations),
         merge_max_generations: Some(state.rollout_merge_max_generations),
+        merge_max_bytes: Some(state.rollout_merge_max_bytes),
         session: state.rollout_session.clone(),
     };
 

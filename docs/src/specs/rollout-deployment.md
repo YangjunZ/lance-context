@@ -168,11 +168,18 @@ To bound this, an instance can **merge its own shard back into the base table** 
 2. appends their rows to the **base table** (`Dataset::append`), and
 3. `commit_update`s the shard manifest to drain **exactly the generations it merged** out of `flushed_generations` — leaving `replay_after_wal_entry_position` untouched, so a reopened writer never re-replays already-merged WAL entries.
 
-**Bounding merge memory (`--rollout-merge-max-generations`, env `ROLLOUT_MERGE_MAX_GENERATIONS`, default 8).** Step 1 buffers the rows it is about to append **entirely in memory** — `Dataset::append` takes a synchronous `RecordBatchReader`, so the batches cannot be streamed lazily off object storage without pushing that IO into the writer's commit window. Peak merge memory is therefore proportional to the bytes in the generations folded by one pass, and rollout rows carry inline `binary_payload` blobs. Left unbounded, a shard that accumulated many large generations makes a single merge allocate the whole shard at once — the failure mode that OOM-killed workers in production.
+**Bounding merge memory.** Each pass buffers the selected generations' rows in memory before committing them to the base table. Inline `binary_payload` blobs can dominate this memory, and generation sizes vary with the flush window and workload. Two independent caps apply to both count-triggered merges and time-triggered cleanup:
 
-`M` caps that: one pass folds at most `M` generations and leaves the rest pending for the next pass. This is safe because the step-3 drain is *surgical* — it removes only the generations actually merged, rather than clearing the list — so a partial merge is just a smaller version of a full one, with the same crash-safety argument below. Repeated passes drain the backlog incrementally at bounded peak memory. `M = 0` restores the unbounded "fold everything in one pass" behavior.
+| Setting | Default | Effect |
+|---|---|---|
+| `--rollout-merge-max-generations` / `ROLLOUT_MERGE_MAX_GENERATIONS` | `8` | Maximum generations folded per pass. |
+| `--rollout-merge-max-bytes` / `ROLLOUT_MERGE_MAX_BYTES` | `1073741824` (1 GiB) | Stop after the generation that brings buffered Arrow array memory to or above this budget. |
 
-Note that `M` binds independently of `N`: the time-triggered cleanup path merges at a threshold of 1 generation, so it does not consult `N` at all, but it is still capped by `M`.
+The caps form an **OR**: whichever binds first ends the pass. Bytes are measured with `RecordBatch::get_array_memory_size()` after schema alignment and before deduplication, including inline blobs and other columns. Embedded Rust callers can set `merge_max_bytes` on their store options; `None` uses the same 1 GiB default. Setting either cap to `0` disables only that cap; both must be `0` to fold every pending generation in one pass.
+
+The manifest reclaims whole generations, so a generation is the smallest indivisible merge unit. A pass always finishes the generation that reaches the budget, even if its first generation alone is oversized. Thus the read buffer can exceed the budget by up to one generation; this is not a hard process-RSS limit, and scan, deduplication and commit allocations need additional headroom.
+
+Only merged generation ids and directories are removed. Leftovers stay pending and drain on subsequent passes. The caps apply independently of the count-trigger threshold (`--rollout-merge-after-generations`), including when time-triggered cleanup merges at a threshold of one generation. Server-managed rollout, datagen and generic stores share these settings.
 
 This is the "external compactor" path that Lance's MemWAL LSM design explicitly anticipates. Two properties make it safe under the §2 deployment model:
 

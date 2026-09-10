@@ -50,3 +50,8 @@ Two periodic sweeps run on the master and feed the shared scheduler queue:
   The master cannot merge a shard it does not own without fencing the live
   writer, so the merge itself always runs on the owning worker. Set the interval
   to `0` to disable it; the manual "Merge WAL" / "Optimize" UI actions still work.
+  On workers, `ROLLOUT_MERGE_MAX_BYTES` (default `1073741824`, 1 GiB) and
+  `ROLLOUT_MERGE_MAX_GENERATIONS` (default `8`) independently cap each pass.
+  The first cap reached ends the pass after a whole generation; an oversized
+  generation still merges in full, and leftovers drain on later passes.
+  Setting either cap to `0` disables only that cap.

@@ -62,9 +62,11 @@ pub struct AppState {
     /// disables it. See `RolloutStoreOptions::merge_after_generations`.
     pub rollout_merge_after_generations: usize,
     /// Per-pass cap on flushed generations folded into the base table. `0` is
-    /// unbounded. Bounds peak merge memory; see
-    /// `Config::rollout_merge_max_generations`.
+    /// disabled; the byte budget still applies. See
+    /// `ServerConfig::rollout_merge_max_generations`.
     pub rollout_merge_max_generations: usize,
+    /// Buffered Arrow array byte budget per merge pass; `0` disables this cap.
+    pub rollout_merge_max_bytes: usize,
     /// Periodic per-shard WAL-cleanup interval in seconds; `0` disables the
     /// global sweeper. See [`Self::spawn_global_sweeper`].
     pub rollout_cleanup_interval_secs: u64,
@@ -232,6 +234,7 @@ impl AppState {
             instance_id,
             rollout_merge_after_generations: config.rollout_merge_after_generations,
             rollout_merge_max_generations: config.rollout_merge_max_generations,
+            rollout_merge_max_bytes: config.rollout_merge_max_bytes,
             rollout_cleanup_interval_secs: config.rollout_cleanup_interval_secs,
             rollout_flush_interval_secs: config.rollout_flush_interval_secs,
             blob_budget,
@@ -293,6 +296,7 @@ impl AppState {
             instance_id,
             rollout_merge_after_generations: 0,
             rollout_merge_max_generations: 8,
+            rollout_merge_max_bytes: 1024 * 1024 * 1024,
             rollout_cleanup_interval_secs: 0,
             rollout_flush_interval_secs: 0,
             blob_budget: None,
@@ -325,6 +329,7 @@ impl AppState {
             merge_after_generations: (self.rollout_merge_after_generations > 0)
                 .then_some(self.rollout_merge_after_generations),
             merge_max_generations: Some(self.rollout_merge_max_generations),
+            merge_max_bytes: Some(self.rollout_merge_max_bytes),
             session: self.rollout_session.clone(),
         }
     }
@@ -477,6 +482,7 @@ impl AppState {
             merge_after_generations: (self.rollout_merge_after_generations > 0)
                 .then_some(self.rollout_merge_after_generations),
             merge_max_generations: Some(self.rollout_merge_max_generations),
+            merge_max_bytes: Some(self.rollout_merge_max_bytes),
             cleanup_interval_secs: None,
         }
     }
@@ -581,6 +587,7 @@ impl AppState {
             merge_after_generations: (self.rollout_merge_after_generations > 0)
                 .then_some(self.rollout_merge_after_generations),
             merge_max_generations: Some(self.rollout_merge_max_generations),
+            merge_max_bytes: Some(self.rollout_merge_max_bytes),
             session: self.rollout_session.clone(),
             seal_on_add,
         }

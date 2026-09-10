@@ -40,6 +40,7 @@ impl GenericStore {
             shard_id: None,
             merge_after_generations: None,
             merge_max_generations: None,
+            merge_max_bytes: None,
             session: None,
             seal_on_add,
         };
@@ -60,6 +61,7 @@ impl GenericStore {
             shard_id: None,
             merge_after_generations: None,
             merge_max_generations: None,
+            merge_max_bytes: None,
             session: None,
             seal_on_add,
         };

@@ -51,13 +51,14 @@ pub struct DatagenStoreOptions {
     /// threshold is reached. `None` or zero disables count-triggered merging.
     pub merge_after_generations: Option<usize>,
     /// Maximum flushed generations folded into the base table by one merge
-    /// pass. `None` uses the crate default (8); `Some(0)` means unbounded.
-    ///
-    /// A merge buffers every row of every generation it takes before appending,
-    /// so this caps peak merge memory. Leftover generations stay pending for the
-    /// next pass. Raise it only if merge commits are the bottleneck and the
-    /// rows are known to be small.
+    /// pass. `None` uses the crate default (8); `Some(0)` disables this cap.
+    /// The byte budget applies independently. Leftovers stay pending.
     pub merge_max_generations: Option<usize>,
+    /// Buffered Arrow array byte budget per merge pass. `None` uses 1 GiB;
+    /// `Some(0)` disables only this cap. Stops after the generation that
+    /// reaches the budget, or the generation-count cap, whichever comes first.
+    /// A generation is indivisible, so even an oversized one is fully merged.
+    pub merge_max_bytes: Option<usize>,
     /// Periodically merge this writer's pending generations. `None` or zero
     /// disables the timer.
     pub cleanup_interval_secs: Option<u64>,
@@ -101,6 +102,7 @@ impl DatagenStore {
                 shard_id: options.shard_id.clone(),
                 merge_after_generations: options.merge_after_generations,
                 merge_max_generations: options.merge_max_generations,
+                merge_max_bytes: options.merge_max_bytes,
                 session: None,
                 schema: Arc::new(datagen_log_schema()),
                 // Datagen keys on `event_id`, not `id`: event ids are derived

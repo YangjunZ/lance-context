@@ -94,6 +94,9 @@ pub(crate) const DEFAULT_OBSERVE_CONCURRENCY: usize = 16;
 /// takes them.
 pub(crate) const DEFAULT_MERGE_MAX_GENERATIONS: usize = 8;
 
+/// Buffered Arrow array bytes per merge pass, checked at generation boundaries.
+pub(crate) const DEFAULT_MERGE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
 /// Execute only the first `max_source_fragments` from a Lance compaction plan.
 ///
 /// Lance's built-in `max_source_fragments` stops before a whole planned task
@@ -215,14 +218,14 @@ pub(crate) struct StorageBaseOptions {
     /// Count-triggered self-merge threshold; `None`/`0` disables it.
     pub merge_after_generations: Option<usize>,
     /// Maximum flushed generations folded into the base table by one merge
-    /// pass. `None`/`0` means unbounded (every pending generation at once).
-    ///
-    /// This bounds peak merge memory. `read_flushed_generations` buffers every
-    /// row of every generation it takes, and rollout rows carry `binary_payload`
-    /// inline, so an unbounded pass over a backlog materialises the full blob
-    /// volume at once -- the worker OOM this exists to prevent. Leftover
-    /// generations stay pending and the next pass takes them.
+    /// pass. `None` uses the crate default (8); `Some(0)` disables this cap.
+    /// The byte budget applies independently. Leftovers stay pending.
     pub merge_max_generations: Option<usize>,
+    /// Buffered Arrow array byte budget per merge pass. `None` uses 1 GiB;
+    /// `Some(0)` disables only this cap. Stops after the generation that
+    /// reaches the budget, or the generation-count cap, whichever comes first.
+    /// A generation is indivisible, so even an oversized one is fully merged.
+    pub merge_max_bytes: Option<usize>,
     /// Shared, capacity-bounded Lance session. `None` preserves Lance's
     /// per-open default (a fresh 6 GiB index + 1 GiB metadata session *per
     /// store*, which is the source of unbounded per-append RSS growth).
@@ -283,6 +286,7 @@ pub(crate) struct StorageBase {
     /// Self-merge threshold; `0` disables it.
     merge_after_generations: usize,
     merge_max_generations: usize,
+    merge_max_bytes: usize,
     /// Timestamp of the last successful [`Self::compact`] on this handle.
     last_compaction: Option<DateTime<Utc>>,
     /// Number of successful compactions performed by this handle.
@@ -336,6 +340,7 @@ impl StorageBase {
             shard_id,
             merge_after_generations,
             merge_max_generations,
+            merge_max_bytes,
             session,
             schema,
             key_column,
@@ -365,6 +370,7 @@ impl StorageBase {
                 shard_id,
                 merge_after_generations,
                 merge_max_generations,
+                merge_max_bytes,
                 session,
                 schema,
                 key_column,
@@ -388,6 +394,7 @@ impl StorageBase {
             shard_id,
             merge_after_generations,
             merge_max_generations,
+            merge_max_bytes,
             session,
             schema,
             key_column,
@@ -412,6 +419,7 @@ impl StorageBase {
             seal_on_put,
             merge_after_generations: merge_after_generations.unwrap_or(0),
             merge_max_generations: merge_max_generations.unwrap_or(DEFAULT_MERGE_MAX_GENERATIONS),
+            merge_max_bytes: merge_max_bytes.unwrap_or(DEFAULT_MERGE_MAX_BYTES),
             last_compaction: None,
             total_compactions: 0,
             last_compaction_error: None,
@@ -801,7 +809,7 @@ impl StorageBase {
     }
 
     /// The `&self` half of a merge: everything that can run while appends
-    /// continue — sealing the memtable and reading every flushed generation
+    /// continue — sealing the memtable and reading the budgeted generations
     /// into memory.
     ///
     /// # Concurrency: the expensive phase does not need exclusive access
@@ -824,7 +832,7 @@ impl StorageBase {
         // close the writer, so appends continue throughout.
         observe_phase!("seal", self.flush().await)?;
 
-        // The expensive phase: pull every flushed generation out of object
+        // The expensive phase: pull a budgeted prefix of generations out of object
         // storage. Buffered in memory, so this is the part that must not hold an
         // exclusive lock.
         let (merged_generations, merged_paths, batches, merge_schema) =
@@ -967,7 +975,7 @@ impl StorageBase {
         Ok(())
     }
 
-    /// Read every flushed generation listed in `manifest` into memory, aligned
+    /// Read a budgeted prefix of flushed generations in `manifest`, aligned
     /// to the base table's current schema.
     ///
     /// Returns the merged generation ids, their on-storage folder names (needed
@@ -984,32 +992,16 @@ impl StorageBase {
         let mut generation_batches: Vec<(u64, Vec<RecordBatch>)> = Vec::new();
         let merge_schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
 
-        // Read at most `merge_max_generations` generations per pass.
+        // Stop when either cap binds. Count the aligned batches before dedup:
+        // all of their arrays (including inline blobs) are resident during this
+        // read phase, even if dedup will later discard some rows.
         //
-        // Every row of every generation is buffered here and stays resident in
-        // `PreparedMerge.batches` until the commit appends it, so peak memory
-        // for one merge is the *total* size of the generations taken. Rollout
-        // rows carry `binary_payload` inline (blob-v2 offload reads back as
-        // `None` through the LSM scanner, so it cannot be used here), which
-        // means multi-MB artifacts are in these batches. Unbounded, one pass
-        // over a large backlog materialises hundreds of MB to several GiB; on
-        // glibc that memory is freed logically but retained in the allocator's
-        // arenas, so worker RSS ratchets up a step per merge and never returns.
-        //
-        // Capping the *count* is what bounds it, and it is safe because a merge
-        // of a subset is already a first-class case: `commit_merge` drains only
-        // the generation ids it actually merged (a relative, retain-not-in-set
-        // edit) and deletes only those directories, precisely so a concurrent
-        // flush is not clobbered. Whatever is left over stays pending and the
-        // next pass takes it -- the same incremental-progress shape as the
-        // master-side compaction budget in #229.
-        //
-        // Generations are the granularity because the drain removes whole ids;
-        // splitting one generation's rows across two passes would leave rows
-        // committed to the base table with the generation still listed. That is
-        // read-safe (the LSM dedups by key) but would re-read and re-append
-        // those rows on the next pass, so the budget stops at a generation
-        // boundary.
+        // The manifest drains whole generation ids, so a generation is the
+        // smallest indivisible unit. Finish the generation that reaches the
+        // byte budget and stop before opening the next one. This may overshoot
+        // by one generation, but always makes progress, including when the
+        // first generation alone exceeds the budget. Leftovers stay pending.
+        let mut buffered_bytes = 0usize;
         let budget = if self.merge_max_generations == 0 {
             manifest.flushed_generations.len()
         } else {
@@ -1031,12 +1023,17 @@ impl StorageBase {
             let mut stream = gen_dataset.scan().try_into_stream().await?;
             while let Some(batch) = stream.try_next().await? {
                 if batch.num_rows() > 0 {
-                    current_batches.push(align_batch_to_schema(batch, merge_schema.clone())?);
+                    let batch = align_batch_to_schema(batch, merge_schema.clone())?;
+                    buffered_bytes = buffered_bytes.saturating_add(batch.get_array_memory_size());
+                    current_batches.push(batch);
                 }
             }
             generation_batches.push((flushed.generation, current_batches));
             merged_generations.insert(flushed.generation);
             merged_paths.push(flushed.path.clone());
+            if self.merge_max_bytes != 0 && buffered_bytes >= self.merge_max_bytes {
+                break;
+            }
         }
         let batches =
             dedupe_merge_batches(generation_batches, &self.key_column, merge_schema.clone())?;

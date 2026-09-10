@@ -246,10 +246,9 @@ async fn merge_pass_is_bounded_and_leftovers_survive() {
     );
 }
 
-/// `merge_max_generations: Some(0)` restores the unbounded behavior, so a
-/// deployment can opt out without reverting.
+/// Disabling both caps restores the unbounded behavior.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn zero_max_generations_merges_everything_in_one_pass() {
+async fn zero_merge_caps_merge_everything_in_one_pass() {
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().to_string_lossy().to_string();
 
@@ -257,6 +256,7 @@ async fn zero_max_generations_merges_everything_in_one_pass() {
         shard_id: Some("unbounded".to_string()),
         merge_after_generations: None,
         merge_max_generations: Some(0),
+        merge_max_bytes: Some(0),
         ..Default::default()
     };
     let mut store = RolloutStore::open_with_options(&uri, opts).await.unwrap();
@@ -272,4 +272,121 @@ async fn zero_max_generations_merges_everything_in_one_pass() {
         "0 must mean unbounded: one pass takes all six"
     );
     assert_eq!(store.observe().await.unwrap().pending_wal_generations, 0);
+}
+
+/// The same five generations must drain differently as either cap binds.
+/// Small budgets exercise the large-blob behavior without allocating GiBs.
+async fn assert_blob_merge_passes(max_generations: usize, max_bytes: usize, passes: &[usize]) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+    let opts = RolloutStoreOptions {
+        shard_id: Some("byte-budget".to_string()),
+        merge_max_generations: Some(max_generations),
+        merge_max_bytes: Some(max_bytes),
+        ..Default::default()
+    };
+    let mut store = RolloutStore::open_with_options(&uri, opts).await.unwrap();
+    let mut expected = Vec::new();
+    for i in 0..5 {
+        let mut record = rec(&format!("blob-{i}"));
+        record.binary_payload = Some(vec![i as u8; 1024 * 1024]);
+        store.add(std::slice::from_ref(&record)).await.unwrap();
+        store.flush().await.unwrap();
+        expected.push(record);
+    }
+
+    let mut pending = expected.len();
+    for &reclaimed in passes {
+        assert_eq!(store.cleanup_own_shard().await.unwrap(), reclaimed);
+        pending -= reclaimed;
+        assert_eq!(
+            store.observe().await.unwrap().pending_wal_generations,
+            pending as i64,
+            "only merged generations may be drained"
+        );
+        assert_eq!(count_gen_dirs_on_disk(tmp.path()), pending);
+        // Check the union of base and pending generations after every pass,
+        // including the actual inline bytes, not just ids or row counts.
+        let mut listed = store.list(None, None).await.unwrap();
+        listed.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(listed.len(), expected.len());
+        for (actual, expected) in listed.iter().zip(&expected) {
+            assert_eq!(actual.id, expected.id);
+            assert_eq!(
+                store.get_blob(&actual.id).await.unwrap(),
+                expected.binary_payload
+            );
+        }
+    }
+    assert_eq!(pending, 0);
+    assert_eq!(store.cleanup_own_shard().await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn byte_budget_binds_before_generation_cap() {
+    // Each generation is below 1.5 MiB, but two together exceed it.
+    assert_blob_merge_passes(8, 1536 * 1024, &[2, 2, 1]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn byte_budget_applies_with_generation_cap_disabled() {
+    assert_blob_merge_passes(0, 1536 * 1024, &[2, 2, 1]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generation_cap_binds_before_byte_budget() {
+    assert_blob_merge_passes(2, 16 * 1024 * 1024, &[2, 2, 1]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_byte_budget_keeps_generation_cap() {
+    assert_blob_merge_passes(2, 0, &[2, 2, 1]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_generation_is_merged_in_full_and_makes_progress() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+    let opts = RolloutStoreOptions {
+        shard_id: Some("oversized".to_string()),
+        merge_after_generations: Some(1),
+        merge_max_generations: Some(8),
+        merge_max_bytes: Some(1),
+        ..Default::default()
+    };
+    let mut store = RolloutStore::open_with_options(&uri, opts).await.unwrap();
+    for generation in 0..2 {
+        let records: Vec<_> = (0..3)
+            .map(|row| {
+                let mut record = rec(&format!("{generation}-{row}"));
+                record.binary_payload = Some(vec![row; 4096]);
+                record
+            })
+            .collect();
+        store.add(&records).await.unwrap();
+        store.flush().await.unwrap();
+    }
+    // Exercise the count-triggered prepare/commit path as well as cleanup.
+    for pending in [1, 0] {
+        assert_eq!(store.maybe_merge_own_shard().await.unwrap(), 1);
+        assert_eq!(
+            store.observe().await.unwrap().pending_wal_generations,
+            pending
+        );
+        assert_eq!(count_gen_dirs_on_disk(tmp.path()), pending as usize);
+        let listed = store.list(None, None).await.unwrap();
+        assert_eq!(
+            listed.len(),
+            6,
+            "a generation must never be partially drained"
+        );
+        for record in listed {
+            let row = record.id.as_bytes()[2] - b'0';
+            assert_eq!(
+                store.get_blob(&record.id).await.unwrap(),
+                Some(vec![row; 4096])
+            );
+        }
+    }
+    assert_eq!(store.maybe_merge_own_shard().await.unwrap(), 0);
 }

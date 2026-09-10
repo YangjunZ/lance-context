@@ -284,13 +284,14 @@ pub struct ContextStoreOptions {
     /// previously had no bound at all on this store.
     pub merge_after_generations: Option<usize>,
     /// Maximum flushed generations folded into the base table by one merge
-    /// pass. `None` uses the crate default (8); `Some(0)` means unbounded.
-    ///
-    /// A merge buffers every row of every generation it takes before appending,
-    /// so this caps peak merge memory. Leftover generations stay pending for the
-    /// next pass. Raise it only if merge commits are the bottleneck and the
-    /// rows are known to be small.
+    /// pass. `None` uses the crate default (8); `Some(0)` disables this cap.
+    /// The byte budget applies independently. Leftovers stay pending.
     pub merge_max_generations: Option<usize>,
+    /// Buffered Arrow array byte budget per merge pass. `None` uses 1 GiB;
+    /// `Some(0)` disables only this cap. Stops after the generation that
+    /// reaches the budget, or the generation-count cap, whichever comes first.
+    /// A generation is indivisible, so even an oversized one is fully merged.
+    pub merge_max_bytes: Option<usize>,
     /// Whether [`ContextStore::add`] seals the memtable before returning, so the
     /// rows it wrote are immediately readable.
     ///
@@ -321,6 +322,7 @@ impl Default for ContextStoreOptions {
             shard_id: None,
             merge_after_generations: None,
             merge_max_generations: None,
+            merge_max_bytes: None,
             // Read-your-write by default; see the field docs.
             seal_on_add: true,
         }
@@ -601,6 +603,7 @@ impl ContextStore {
                 shard_id: options.shard_id.clone(),
                 merge_after_generations: options.merge_after_generations,
                 merge_max_generations: options.merge_max_generations,
+                merge_max_bytes: options.merge_max_bytes,
                 session: None,
                 schema: Arc::new(arrow_schema.clone()),
                 key_column: "id".to_string(),
@@ -2119,6 +2122,7 @@ impl ContextStore {
             shard_id: None,
             merge_after_generations: None,
             merge_max_generations: None,
+            merge_max_bytes: None,
             // A compactor never appends, so the seal mode is irrelevant to it;
             // deferring keeps it from ever emitting a generation.
             seal_on_add: false,
