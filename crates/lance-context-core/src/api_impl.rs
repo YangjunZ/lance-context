@@ -815,6 +815,13 @@ impl DatagenStoreApi for DatagenStore {
         Ok(failures.iter().map(failure_to_dto).collect())
     }
 
+    async fn events_for_item(&self, item_id: &str) -> ContextResult<Vec<DatagenEventDto>> {
+        let events = DatagenStore::events_for_item(self, item_id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(events.iter().map(datagen_event_to_dto).collect())
+    }
+
     async fn events_for_root(&self, root_item_id: &str) -> ContextResult<Vec<DatagenEventDto>> {
         let events = DatagenStore::events_for_root(self, root_item_id)
             .await
@@ -1007,13 +1014,25 @@ pub fn folded_item_to_dto(item: &FoldedDatagenItem) -> FoldedDatagenItemDto {
 
 fn field_state_to_dto(state: &DatagenFieldState) -> DatagenFieldStateDto {
     match state {
-        DatagenFieldState::Set(value) => DatagenFieldStateDto {
+        DatagenFieldState::Set {
+            value,
+            field_type,
+            codec_version,
+        } => DatagenFieldStateDto {
             mode: "set".to_string(),
+            field_type: Some(field_type.clone()),
+            codec_version: Some(*codec_version),
             value: Some(datagen_value_to_dto(value)),
             values: Vec::new(),
         },
-        DatagenFieldState::Appended(values) => DatagenFieldStateDto {
+        DatagenFieldState::Appended {
+            values,
+            field_type,
+            codec_version,
+        } => DatagenFieldStateDto {
             mode: "append".to_string(),
+            field_type: Some(field_type.clone()),
+            codec_version: Some(*codec_version),
             value: None,
             values: values.iter().map(datagen_value_to_dto).collect(),
         },

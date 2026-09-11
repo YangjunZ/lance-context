@@ -1166,6 +1166,16 @@ mod tests {
 
             let events = store.events_for_item("item-1").await.unwrap();
             assert_eq!(events.len(), 6);
+            assert!(store.pending_wal_generations().await.unwrap() > 0);
+            assert_eq!(
+                Dataset::open(&uri)
+                    .await
+                    .unwrap()
+                    .count_rows(None)
+                    .await
+                    .unwrap(),
+                0
+            );
             let blob_event = events
                 .iter()
                 .find(|event| event.field_name.as_deref() == Some("screenshot"))
@@ -1185,7 +1195,11 @@ mod tests {
             assert_eq!(folded.status, DatagenItemStatus::Completed);
             assert_eq!(
                 folded.fields.get("score"),
-                Some(&DatagenFieldState::Set(DatagenValue::Int(i64::MAX)))
+                Some(&DatagenFieldState::Set {
+                    value: DatagenValue::Int(i64::MAX),
+                    field_type: "int".into(),
+                    codec_version: 1,
+                })
             );
             assert_eq!(folded.trajectory.ordered.len(), 1);
             assert_eq!(folded.query_tags, Some(json!({"domain": "math"})));
@@ -1243,8 +1257,10 @@ mod tests {
 
             // Lazy (the default) leaves the bytes behind; eager projects them into the fold.
             let lazy = store.fold_item("item-1").await.unwrap();
-            let DatagenFieldState::Set(DatagenValue::Blob(lazy_blob)) =
-                lazy.folded().unwrap().fields.get("screenshot").unwrap()
+            let DatagenFieldState::Set {
+                value: DatagenValue::Blob(lazy_blob),
+                ..
+            } = lazy.folded().unwrap().fields.get("screenshot").unwrap()
             else {
                 panic!("screenshot should be a blob");
             };
@@ -1254,8 +1270,10 @@ mod tests {
                 .fold_item_with("item-1", DatagenBlobProjection::Eager)
                 .await
                 .unwrap();
-            let DatagenFieldState::Set(DatagenValue::Blob(eager_blob)) =
-                eager.folded().unwrap().fields.get("screenshot").unwrap()
+            let DatagenFieldState::Set {
+                value: DatagenValue::Blob(eager_blob),
+                ..
+            } = eager.folded().unwrap().fields.get("screenshot").unwrap()
             else {
                 panic!("screenshot should be a blob");
             };
@@ -1650,7 +1668,11 @@ mod tests {
             assert_eq!(root_node.item.query_tags, Some(json!({"lang": "en"})));
             assert_eq!(
                 root_node.item.fields.get("draft"),
-                Some(&DatagenFieldState::Set(DatagenValue::Str("v1".into())))
+                Some(&DatagenFieldState::Set {
+                    value: DatagenValue::Str("v1".into()),
+                    field_type: "str".into(),
+                    codec_version: 1,
+                })
             );
 
             let child_node = tree.node(&child_id).unwrap();

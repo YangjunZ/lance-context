@@ -313,10 +313,19 @@ pub struct DatagenStreamPosition {
 }
 
 /// How a field folds: FIELD_SET replaces (last-writer-wins); FIELD_APPEND accumulates in order.
+/// Codec metadata describes the retained value, or every element of an appended list.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DatagenFieldState {
-    Set(DatagenValue),
-    Appended(Vec<DatagenValue>),
+    Set {
+        value: DatagenValue,
+        field_type: String,
+        codec_version: i32,
+    },
+    Appended {
+        values: Vec<DatagenValue>,
+        field_type: String,
+        codec_version: i32,
+    },
 }
 
 /// A pointer to one completed step position (a single STEP_COMPLETED).
@@ -1101,8 +1110,8 @@ fn drop_blob_bytes(item: &mut FoldedDatagenItem) {
     }
     for state in item.fields.values_mut() {
         match state {
-            DatagenFieldState::Set(value) => strip(value),
-            DatagenFieldState::Appended(values) => values.iter_mut().for_each(strip),
+            DatagenFieldState::Set { value, .. } => strip(value),
+            DatagenFieldState::Appended { values, .. } => values.iter_mut().for_each(strip),
         }
     }
 }
@@ -1218,7 +1227,10 @@ fn apply_event(item: &mut FoldedDatagenItem, event: &DatagenEvent) -> Result<(),
             let value = event.value.clone().unwrap();
             // Group D: a field's value kind is fixed by its first write. A later SET that
             // drifts to another kind means the pipeline wrote the field inconsistently.
-            if let Some(DatagenFieldState::Set(existing)) = item.fields.get(&field_name) {
+            if let Some(DatagenFieldState::Set {
+                value: existing, ..
+            }) = item.fields.get(&field_name)
+            {
                 if existing.kind() != value.kind() {
                     return Err(format!(
                         "field '{}' changes value kind from {} to {}",
@@ -1229,19 +1241,35 @@ fn apply_event(item: &mut FoldedDatagenItem, event: &DatagenEvent) -> Result<(),
                 }
             }
             record_blob_event_id(item, &field_name, &value, &event.event_id);
-            item.fields
-                .insert(field_name, DatagenFieldState::Set(value));
+            item.fields.insert(
+                field_name,
+                DatagenFieldState::Set {
+                    value,
+                    field_type: event.field_type.clone().unwrap(),
+                    codec_version: event.codec_version.unwrap(),
+                },
+            );
         }
         DatagenEventType::FieldAppend => {
             let field_name = event.field_name.clone().unwrap();
             let value = event.value.clone().unwrap();
+            let field_type = event.field_type.as_ref().unwrap();
+            let codec_version = event.codec_version.unwrap();
             record_blob_event_id(item, &field_name, &value, &event.event_id);
             match item.fields.entry(field_name.clone()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(DatagenFieldState::Appended(vec![value]));
+                    entry.insert(DatagenFieldState::Appended {
+                        values: vec![value],
+                        field_type: field_type.clone(),
+                        codec_version,
+                    });
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
-                    DatagenFieldState::Appended(values) => {
+                    DatagenFieldState::Appended {
+                        values,
+                        field_type: existing_type,
+                        codec_version: existing_version,
+                    } => {
                         // Group D: the same kind rule holds within one appended list.
                         if let Some(existing) = values.first() {
                             if existing.kind() != value.kind() {
@@ -1253,9 +1281,19 @@ fn apply_event(item: &mut FoldedDatagenItem, event: &DatagenEvent) -> Result<(),
                                 ));
                             }
                         }
+                        if existing_type != field_type || *existing_version != codec_version {
+                            return Err(format!(
+                                "field '{}' changes append codec from {}@{} to {}@{}",
+                                field_name,
+                                existing_type,
+                                existing_version,
+                                field_type,
+                                codec_version
+                            ));
+                        }
                         values.push(value);
                     }
-                    DatagenFieldState::Set(_) => {
+                    DatagenFieldState::Set { .. } => {
                         return Err(format!(
                             "field '{}' mixes FIELD_SET and FIELD_APPEND",
                             entry.key()
@@ -1467,14 +1505,22 @@ mod tests {
             .unwrap();
         assert_eq!(
             folded.fields.get("draft"),
-            Some(&DatagenFieldState::Set(DatagenValue::Str("v2".to_string())))
+            Some(&DatagenFieldState::Set {
+                value: DatagenValue::Str("v2".to_string()),
+                field_type: "str".to_string(),
+                codec_version: 1,
+            })
         );
         assert_eq!(
             folded.fields.get("revisions"),
-            Some(&DatagenFieldState::Appended(vec![
-                DatagenValue::Json(json!({"n": "a"})),
-                DatagenValue::Json(json!({"n": "b"})),
-            ]))
+            Some(&DatagenFieldState::Appended {
+                values: vec![
+                    DatagenValue::Json(json!({"n": "a"})),
+                    DatagenValue::Json(json!({"n": "b"})),
+                ],
+                field_type: "json".to_string(),
+                codec_version: 1,
+            })
         );
     }
 
@@ -1514,6 +1560,65 @@ mod tests {
 
         let err = fold_datagen_events(&[created(0), append_str, append_int]).unwrap_err();
         assert!(err.contains("changes value kind"), "{err}");
+    }
+
+    #[test]
+    fn set_metadata_tracks_the_winning_value_including_across_attempts() {
+        let mut first = leaf_completed(1, "gen", 0, None);
+        first.event_type = DatagenEventType::FieldSet;
+        first.field_name = Some("date".into());
+        first.field_type = Some("date".into());
+        first.codec_version = Some(1);
+        first.value = Some(DatagenValue::Str("2021-02-03".into()));
+        let mut last = first.clone();
+        last.item_seq = 2;
+        last.checkpoint_id = "next-attempt".into();
+        last.event_id = datagen_event_id("5", "next-attempt", 0);
+        last.attempt = 1;
+        last.field_type = Some("path".into());
+        last.codec_version = Some(2);
+
+        let prefix = fold_datagen_events(&[created(0), first.clone()])
+            .unwrap()
+            .unwrap();
+        let folded = fold_datagen_events(&[last, first, created(0)])
+            .unwrap()
+            .unwrap();
+        for (item, expected_type, expected_version) in [(&prefix, "date", 1), (&folded, "path", 2)]
+        {
+            let dto = crate::api_impl::folded_item_to_dto(item);
+            let field = &dto.fields["date"];
+            assert_eq!(field.field_type.as_deref(), Some(expected_type));
+            assert_eq!(field.codec_version, Some(expected_version));
+            assert_eq!(field.mode, "set");
+        }
+    }
+
+    #[test]
+    fn append_rejects_field_type_or_codec_version_drift_with_the_same_value_kind() {
+        let mut first = leaf_completed(1, "gen", 0, None);
+        first.event_type = DatagenEventType::FieldAppend;
+        first.field_name = Some("dates".into());
+        first.field_type = Some("date".into());
+        first.codec_version = Some(1);
+        first.value = Some(DatagenValue::Str("2021-02-03".into()));
+
+        for (field_type, codec_version) in [("path", 1), ("date", 2)] {
+            let mut next = first.clone();
+            next.item_seq = 2;
+            next.checkpoint_id = "next-attempt".into();
+            next.event_id = datagen_event_id("5", "next-attempt", 0);
+            next.attempt = 1;
+            next.field_type = Some(field_type.into());
+            next.codec_version = Some(codec_version);
+            let err = fold_datagen_events(&[created(0), first.clone(), next]).unwrap_err();
+            assert!(
+                err.contains(&format!(
+                    "field 'dates' changes append codec from date@1 to {field_type}@{codec_version}"
+                )),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -1581,7 +1686,11 @@ mod tests {
         assert_eq!(folded.last_item_seq, 4);
         assert_eq!(
             folded.fields.get("draft"),
-            Some(&DatagenFieldState::Set(DatagenValue::Str("v2".to_string())))
+            Some(&DatagenFieldState::Set {
+                value: DatagenValue::Str("v2".to_string()),
+                field_type: "str".to_string(),
+                codec_version: 1,
+            })
         );
 
         // The failure lens still surfaces the attempt-0 failure, tagged with its attempt.
@@ -1652,7 +1761,11 @@ mod tests {
         assert_eq!(folded.status, DatagenItemStatus::Completed);
         assert_eq!(
             folded.fields.get("draft"),
-            Some(&DatagenFieldState::Set(DatagenValue::Str("v1".into())))
+            Some(&DatagenFieldState::Set {
+                value: DatagenValue::Str("v1".into()),
+                field_type: "str".into(),
+                codec_version: 1,
+            })
         );
         assert_eq!(folded.query_tags, Some(json!({"lang": "en"})));
     }
@@ -1704,7 +1817,11 @@ mod tests {
         assert_eq!(folded.last_attempt, 1);
         assert_eq!(
             folded.fields.get("draft"),
-            Some(&DatagenFieldState::Set(DatagenValue::Str("v2".into())))
+            Some(&DatagenFieldState::Set {
+                value: DatagenValue::Str("v2".into()),
+                field_type: "str".into(),
+                codec_version: 1,
+            })
         );
     }
 
@@ -1777,9 +1894,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             folded.fields.get("messages"),
-            Some(&DatagenFieldState::Appended(vec![DatagenValue::Json(
-                json!({"role": "assistant"})
-            )]))
+            Some(&DatagenFieldState::Appended {
+                values: vec![DatagenValue::Json(json!({"role": "assistant"}))],
+                field_type: "json".into(),
+                codec_version: 1,
+            })
         );
     }
 
@@ -1925,25 +2044,35 @@ mod tests {
         let lazy = fold_datagen_events_with(&events, DatagenBlobProjection::Lazy)
             .unwrap()
             .unwrap();
-        let DatagenFieldState::Set(DatagenValue::Blob(lazy_blob)) =
-            lazy.fields.get("image").unwrap()
+        let DatagenFieldState::Set {
+            value: DatagenValue::Blob(lazy_blob),
+            field_type,
+            codec_version,
+        } = lazy.fields.get("image").unwrap()
         else {
             panic!("expected a blob field");
         };
         assert_eq!(lazy_blob.bytes, None);
         assert_eq!(lazy_blob.size, 9);
+        assert_eq!(field_type, "blob");
+        assert_eq!(*codec_version, 1);
         // The default fold is the lazy one.
         assert_eq!(fold_datagen_events(&events).unwrap().unwrap(), lazy);
 
         let eager = fold_datagen_events_with(&events, DatagenBlobProjection::Eager)
             .unwrap()
             .unwrap();
-        let DatagenFieldState::Set(DatagenValue::Blob(eager_blob)) =
-            eager.fields.get("image").unwrap()
+        let DatagenFieldState::Set {
+            value: DatagenValue::Blob(eager_blob),
+            field_type,
+            codec_version,
+        } = eager.fields.get("image").unwrap()
         else {
             panic!("expected a blob field");
         };
         assert_eq!(eager_blob.bytes.as_deref(), Some(&b"png-bytes"[..]));
+        assert_eq!(field_type, "blob");
+        assert_eq!(*codec_version, 1);
     }
 
     #[test]

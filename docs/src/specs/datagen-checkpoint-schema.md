@@ -122,6 +122,11 @@ for the exact `_rowid`.
    (started minus completed) is the driver frame open at crash time.
 7. `FAILED` and `TERMINAL` are ordinary log events, not separate datasets.
 8. Blob bytes are loaded only when the corresponding lazy reference is used.
+9. Folded fields retain `field_type` and `codec_version`. A `FIELD_SET` keeps
+   the winning event's metadata; all values in a `FIELD_APPEND` list must have
+   the same codec pair. Mixed append codecs are rejected during folding,
+   including across attempts. Consumers compare the retained pair with the
+   expected codec before decoding on resume.
 
 ## Maintenance
 

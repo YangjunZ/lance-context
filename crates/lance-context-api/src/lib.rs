@@ -347,8 +347,16 @@ pub trait DatagenStoreApi {
         item_id: &str,
     ) -> impl Future<Output = ContextResult<Vec<DatagenFailureDto>>> + Send;
 
-    /// Raw-dump every event for a root and its projected descendants, oldest
-    /// first. The transport-thin read the inspection tree is folded from
+    /// Read one item's raw history in `(item_seq, event_id)` order, without blob bytes.
+    /// Missing items return an empty list; use `get_blob(event_id)` for payloads.
+    fn events_for_item(
+        &self,
+        item_id: &str,
+    ) -> impl Future<Output = ContextResult<Vec<DatagenEventDto>>> + Send;
+
+    /// Raw-dump every event for a root and its projected descendants, grouped by
+    /// item and ordered by `(item_seq, event_id)` within each item, without blob bytes.
+    /// The transport-thin read the inspection tree is folded from
     /// client-side, so the same `DatagenItemTree` assembly runs for embedded and
     /// remote without duplicating fold logic on the server.
     fn events_for_root(
@@ -1149,6 +1157,12 @@ pub struct AddDatagenEventsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatagenFieldStateDto {
     pub mode: String,
+    /// Absent only when reading a response from an older server. This is unknown
+    /// metadata, not a default codec; callers must not infer it from a declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_version: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<DatagenValueDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1543,6 +1557,18 @@ pub struct TaskListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn datagen_legacy_folded_field_has_unknown_codec_not_a_default() {
+        let field: DatagenFieldStateDto = serde_json::from_value(serde_json::json!({
+            "mode": "set",
+            "value": {"kind": "str", "value": "2021-02-03"},
+        }))
+        .unwrap();
+        assert_eq!(field.field_type, None);
+        assert_eq!(field.codec_version, None);
+        assert!(field.value.is_some());
+    }
 
     #[test]
     fn search_request_legacy_payload_defaults_filters_and_lifecycle() {

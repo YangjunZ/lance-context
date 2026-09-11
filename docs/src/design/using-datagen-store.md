@@ -177,6 +177,29 @@ match store.fold_item("5").await? {
 `Found` item's `status` is always a *lifecycle* value (`running` / `completed`
 / `filtered`) — `failed` never appears here.
 
+Each folded field retains the `field_type` and `codec_version` of its stored
+value, alongside the existing `mode` and `value` / `values`. In Python:
+
+```python
+{
+    "mode": "set",
+    "field_type": "date",
+    "codec_version": 1,
+    "value": {"kind": "str", "value": "2021-02-03"},
+}
+```
+
+`FIELD_SET` retains the last value and that event's codec metadata, preserving
+the existing value-kind check. `FIELD_APPEND` retains one codec pair for the
+entire list: every append must agree on both `field_type` and `codec_version`,
+as well as the value kind. A mismatch is a fold error, not a silent choice of
+the first element's codec. Raw events remain readable for diagnosis.
+
+Before decoding on resume, the application must compare the stored codec pair
+with its expected codec. For example, `date` and `Path` may both encode as
+`kind="str"` but must not silently decode as each other. Returning metadata
+enables this check; the store does not perform application-specific decoding.
+
 ### Resume: the open frame
 
 The trajectory records both started and completed positions. `started \ completed`
@@ -196,6 +219,75 @@ let open: Vec<_> = item.trajectory.started
 // Every event under root "5", including all fan-out sub-items — one filter.
 let events = store.events_for_root("5").await?;
 ```
+
+### Raw history from Python (embedded or remote)
+
+`DatagenStore.item_events(item_id)` and `root_events(root_item_id)` return
+raw event dicts, including overwritten field values, provenance, attempts and
+codec metadata. These reads scan the base table **and flushed MemWAL**;
+`lance.dataset(uri)` alone can report zero rows while the events are still in
+the WAL. As with existing reads, remote writes become visible after the
+server's flush, not necessarily immediately after append returns.
+Before each remote raw-history scan, the server refreshes an unpinned handle's
+base version. This adds a manifest read but avoids returning an old, nonempty
+prefix after an external writer merges its WAL into the base. The potentially
+large scan runs under a read lock, not the exclusive refresh lock.
+An embedded handle has no such automatic refresh: it scans the base version
+it last loaded, so a long-lived reader can miss events another process has
+already merged. Reopen the store, or use the server, when reading history
+written elsewhere.
+
+```python
+from lance_context import DatagenStore
+
+store = DatagenStore.open("./experiment.lance")
+# Or: store = DatagenStore.connect("http://localhost:3000", "experiment")
+events = store.item_events("5")
+root_events = store.root_events("5")
+
+# Reconstruct state at a completed-step boundary in the application:
+completed = [event for event in events if event["event_type"] == "STEP_COMPLETED"]
+if completed:
+    cutoff = completed[0]["item_seq"]
+    prefix = [event for event in events if event["item_seq"] <= cutoff]
+    # Apply the application's historical fold to this prefix.
+```
+
+Missing items or roots return `[]`. A missing remote *store* is still an error.
+Item events are ordered by `(item_seq, event_id)`; root events are ordered by
+`(item_id, item_seq, event_id)`. Sequence counters are per item, so a root's
+result is **not** a single cross-item timeline. Group by item before folding
+prefixes, and use `parent_item_id` to link nodes in the inspection tree.
+
+Raw reads omit blob bytes. For an overwritten blob, use the historical row's
+`event_id` with `store.get_blob(event_id)`, rather than the latest folded
+field's blob pointer. This avoids eagerly downloading every historical blob.
+
+The HTTP item-history route is
+`GET /api/v1/datagen/{name}/items/{item_id}/events`; the existing root-history
+route is `GET /api/v1/datagen/{name}/roots/{root_item_id}/events`. IDs must be
+encoded as single URL path segments, including any fan-out slashes. The
+official client handles this encoding.
+
+### Compatibility of history and codec reads
+
+- No event-schema change or data rewrite is needed: existing field events
+  already contain the codec columns.
+- Existing Python `mode`, `value` and `values` keys remain. Code that compares
+  whole field dicts must account for the two added metadata keys.
+- Older servers omit codec metadata; the new Python client reports `None` for
+  it. A codec-safe reader must explicitly reject unknown metadata or use a
+  deliberate application migration policy, never infer it from the current
+  declaration. Upgrade the server before using the new item-history route.
+- Previously accepted histories that mix append codecs now fail to fold,
+  including folds used by resume, trees and overviews. This is an intentional
+  correctness change; raw history can still be inspected.
+- Rust source users must update `DatagenFieldState` tuple variants to named
+  fields (`Set { value, field_type, codec_version }` and
+  `Appended { values, field_type, codec_version }`), DTO struct literals, and
+  custom `DatagenStoreApi` implementations for `events_for_item`.
+- These changes are specific to Datagen. Context, Rollout and Generic store
+  contracts and the shared MemWAL implementation are unchanged.
 
 ### Bulk startup classification
 

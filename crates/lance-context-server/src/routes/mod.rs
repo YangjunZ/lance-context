@@ -140,6 +140,10 @@ pub fn router() -> Router<Arc<AppState>> {
             get(datagen::datagen_item_failures),
         )
         .route(
+            "/api/v1/datagen/{name}/items/{item_id}/events",
+            get(datagen::datagen_events_for_item),
+        )
+        .route(
             "/api/v1/datagen/{name}/overview",
             get(datagen::datagen_overview),
         )

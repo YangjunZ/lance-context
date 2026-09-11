@@ -207,27 +207,41 @@ async fn datagen_failures_refreshing_on_empty(
         .map_err(AppError::from_context)
 }
 
-async fn datagen_events_for_root_refreshing_on_empty(
+async fn datagen_events_at_latest(
     store_lock: &RwLock<DatagenStore>,
-    root_item_id: &str,
+    id: &str,
+    scope: EventScope,
 ) -> Result<Vec<lance_context_api::DatagenEventDto>, AppError> {
     {
-        let store = store_lock.read().await;
-        let events = DatagenStoreApi::events_for_root(&*store, root_item_id)
-            .await
-            .map_err(AppError::from_context)?;
-        if !events.is_empty() || store.is_version_pinned() {
-            return Ok(events);
+        // A merge can leave a nonempty cached base missing newer events whose WAL
+        // generations have been removed. Refresh even when the old prefix is nonempty.
+        let mut store = store_lock.write().await;
+        if !store.is_version_pinned() {
+            store.refresh_latest().await.map_err(AppError::from_lance)?;
         }
     }
+    let store = store_lock.read().await;
+    scope.read(&store, id).await
+}
 
-    let mut store = store_lock.write().await;
-    if !store.is_version_pinned() {
-        store.refresh_latest().await.map_err(AppError::from_lance)?;
-    }
-    DatagenStoreApi::events_for_root(&*store, root_item_id)
-        .await
+#[derive(Clone, Copy)]
+enum EventScope {
+    Item,
+    Root,
+}
+
+impl EventScope {
+    async fn read(
+        self,
+        store: &DatagenStore,
+        id: &str,
+    ) -> Result<Vec<lance_context_api::DatagenEventDto>, AppError> {
+        match self {
+            Self::Item => DatagenStoreApi::events_for_item(store, id).await,
+            Self::Root => DatagenStoreApi::events_for_root(store, id).await,
+        }
         .map_err(AppError::from_context)
+    }
 }
 
 async fn datagen_root_statuses_refreshing_on_missing(
@@ -310,6 +324,16 @@ pub async fn datagen_item_failures(
     Ok(Json(ListDatagenFailuresResponse { failures }))
 }
 
+/// Read one item's raw history in sequence order, without materializing blobs.
+pub async fn datagen_events_for_item(
+    State(state): State<Arc<AppState>>,
+    Path((name, item_id)): Path<(String, String)>,
+) -> Result<Json<lance_context_api::ListDatagenEventsResponse>, AppError> {
+    let store_lock = state.get_or_open_datagen_store(&name).await?;
+    let events = datagen_events_at_latest(&store_lock, &item_id, EventScope::Item).await?;
+    Ok(Json(ListDatagenEventsResponse { events }))
+}
+
 /// Dump every raw event whose root item is `root_item_id`. The server does no
 /// fold/tree assembly; the client builds the item tree from these events.
 pub async fn datagen_events_for_root(
@@ -317,7 +341,7 @@ pub async fn datagen_events_for_root(
     Path((name, root_item_id)): Path<(String, String)>,
 ) -> Result<Json<lance_context_api::ListDatagenEventsResponse>, AppError> {
     let store_lock = state.get_or_open_datagen_store(&name).await?;
-    let events = datagen_events_for_root_refreshing_on_empty(&store_lock, &root_item_id).await?;
+    let events = datagen_events_at_latest(&store_lock, &root_item_id, EventScope::Root).await?;
     Ok(Json(ListDatagenEventsResponse { events }))
 }
 
@@ -419,6 +443,72 @@ mod tests {
             traceback: None,
             event_ts: Utc::now(),
             schema_version: DATAGEN_SCHEMA_VERSION,
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_event_reads_refresh_after_an_external_merge() {
+        let (state, _dir) = test_state().await;
+        for (scope, name, seed_cached_base) in [
+            (EventScope::Item, "item-history-empty", false),
+            (EventScope::Root, "root-history-empty", false),
+            (EventScope::Item, "item-history-nonempty", true),
+            (EventScope::Root, "root-history-nonempty", true),
+        ] {
+            let _ = create_datagen_store(
+                State(state.clone()),
+                Json(CreateDatagenStoreRequest {
+                    name: name.into(),
+                    storage_options: None,
+                }),
+            )
+            .await
+            .unwrap();
+            let cached = state.get_or_open_datagen_store(name).await.unwrap();
+            let mut external = DatagenStore::open_existing_with_options(
+                &state.datagen_uri(name),
+                DatagenStoreOptions {
+                    shard_id: Some("external".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            if seed_cached_base {
+                external
+                    .append(&[event("root", 0, "seed", 0, DatagenEventType::ItemCreated)])
+                    .await
+                    .unwrap();
+                assert_eq!(external.cleanup_own_shard().await.unwrap(), 1);
+                // Load the seeded base so the next merge leaves a nonempty stale prefix.
+                let seeded = datagen_events_at_latest(&cached, "root", scope)
+                    .await
+                    .unwrap();
+                assert_eq!(seeded.len(), 1);
+            }
+            external
+                .append(&[event(
+                    "root",
+                    i64::from(seed_cached_base),
+                    "created",
+                    0,
+                    DatagenEventType::ItemCreated,
+                )])
+                .await
+                .unwrap();
+            assert_eq!(external.cleanup_own_shard().await.unwrap(), 1);
+            assert_eq!(external.pending_wal_generations().await.unwrap(), 0);
+            assert!(external.version() > cached.read().await.version());
+            let events = datagen_events_at_latest(&cached, "root", scope)
+                .await
+                .unwrap();
+            assert_eq!(
+                events.len(),
+                1 + usize::from(seed_cached_base),
+                "a full-history read must not return a stale prefix"
+            );
+            assert_eq!(events[0].item_id, "root");
+            assert_eq!(cached.read().await.version(), external.version());
         }
     }
 

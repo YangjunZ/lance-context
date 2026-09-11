@@ -188,6 +188,10 @@ impl DatagenStoreApi for DatagenStore {
         dispatch_ref!(self, item_failures, item_id)
     }
 
+    async fn events_for_item(&self, item_id: &str) -> ContextResult<Vec<DatagenEventDto>> {
+        dispatch_ref!(self, events_for_item, item_id)
+    }
+
     async fn events_for_root(&self, root_item_id: &str) -> ContextResult<Vec<DatagenEventDto>> {
         dispatch_ref!(self, events_for_root, root_item_id)
     }

@@ -2875,6 +2875,11 @@ class DatagenStore:
 
         ``load_blobs`` materializes blob-field bytes inline; the default leaves them
         lazy, to be resolved through :meth:`get_blob` / :meth:`load_blob`.
+
+        Each field includes ``field_type`` and ``codec_version`` from the stored
+        events. Compare them with the expected codec before decoding on resume.
+        Older servers return ``None`` for unavailable metadata, not a default codec.
+        Appended fields with mixed codec metadata are rejected during folding.
         """
         return self._sync.fold_item(item_id, load_blobs)
 
@@ -2899,6 +2904,25 @@ class DatagenStore:
     def item_failures(self, item_id: str) -> list[dict[str, Any]]:
         """All failure records for an item (the failure lens), oldest first."""
         return self._sync.item_failures(item_id)
+
+    def item_events(self, item_id: str) -> list[dict[str, Any]]:
+        """Every event for one item in ``(item_seq, event_id)`` order.
+
+        Reads the base table and flushed WAL, for embedded and remote stores.
+        Missing items return an empty list. Blob bytes are omitted; resolve a
+        historical blob using that row's ``event_id`` with :meth:`get_blob`.
+        """
+        return self._sync.item_events(item_id)
+
+    def root_events(self, root_item_id: str) -> list[dict[str, Any]]:
+        """Every event for a root and its descendants, grouped by item.
+
+        Ordered by ``(item_id, item_seq, event_id)``, not a cross-item timeline.
+        Reads the base table and flushed WAL; missing roots return an empty list.
+        Blob bytes are omitted; resolve them with :meth:`get_blob(event_id)`.
+        Works for embedded and remote stores.
+        """
+        return self._sync.root_events(root_item_id)
 
     def get_blob(self, event_id: str) -> bytes | None:
         """Materialize one ``FIELD_*`` event's blob bytes by event id, or ``None``."""

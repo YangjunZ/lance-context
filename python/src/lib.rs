@@ -2795,6 +2795,33 @@ impl DatagenStore {
         Ok(list.into_pyobject(py)?.unbind().into())
     }
 
+    /// One item's raw history in sequence order, without blob bytes.
+    fn item_events(&self, py: Python<'_>, item_id: &str) -> PyResult<PyObject> {
+        let events = py
+            .allow_threads(|| self.runtime.block_on(self.store.events_for_item(item_id)))
+            .map_err(ctx_to_py_err)?;
+        let list = PyList::empty(py);
+        for event in &events {
+            list.append(event_dto_to_py(py, event)?)?;
+        }
+        Ok(list.into_pyobject(py)?.unbind().into())
+    }
+
+    /// A root's raw history, grouped by item and ordered within each item, without blob bytes.
+    fn root_events(&self, py: Python<'_>, root_item_id: &str) -> PyResult<PyObject> {
+        let events = py
+            .allow_threads(|| {
+                self.runtime
+                    .block_on(self.store.events_for_root(root_item_id))
+            })
+            .map_err(ctx_to_py_err)?;
+        let list = PyList::empty(py);
+        for event in &events {
+            list.append(event_dto_to_py(py, event)?)?;
+        }
+        Ok(list.into_pyobject(py)?.unbind().into())
+    }
+
     /// Materialize one FIELD_* event's blob bytes by event id, or `None`.
     fn get_blob(&self, py: Python<'_>, event_id: &str) -> PyResult<Option<Py<PyBytes>>> {
         let bytes = py
@@ -3370,6 +3397,8 @@ fn folded_item_to_py(py: Python<'_>, item: &FoldedDatagenItemDto) -> PyResult<Py
 fn field_state_to_py(py: Python<'_>, state: &DatagenFieldStateDto) -> PyResult<PyObject> {
     let dict = PyDict::new(py);
     dict.set_item("mode", &state.mode)?;
+    dict.set_item("field_type", state.field_type.as_deref())?;
+    dict.set_item("codec_version", state.codec_version)?;
     if let Some(value) = &state.value {
         dict.set_item("value", value_to_py(py, value)?)?;
     }

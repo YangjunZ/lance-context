@@ -587,6 +587,15 @@ impl DatagenStoreApi for RemoteDatagenStore {
         Ok(resp.failures)
     }
 
+    async fn events_for_item(&self, item_id: &str) -> ContextResult<Vec<DatagenEventDto>> {
+        let resp = self
+            .client
+            .datagen_events_for_item(&self.store_name, item_id)
+            .await
+            .map_err(to_ctx_err)?;
+        Ok(resp.events)
+    }
+
     async fn events_for_root(&self, root_item_id: &str) -> ContextResult<Vec<DatagenEventDto>> {
         let resp = self
             .client
@@ -1365,7 +1374,17 @@ impl ContextClient {
         Self::handle_response(resp).await
     }
 
-    /// Fetch every raw event whose root item is `root_item_id`. The client
+    /// Fetch one item's raw history in sequence order, without blob bytes.
+    pub async fn datagen_events_for_item(
+        &self,
+        name: &str,
+        item_id: &str,
+    ) -> Result<ListDatagenEventsResponse, ClientError> {
+        self.datagen_events(name, "items", item_id).await
+    }
+
+    /// Fetch every raw event whose root item is `root_item_id`, grouped by item
+    /// and ordered by sequence within each item, without blob bytes. The client
     /// folds these into a tree via `DatagenItemTree::build`; the server does no
     /// fold/tree work.
     pub async fn datagen_events_for_root(
@@ -1373,11 +1392,23 @@ impl ContextClient {
         name: &str,
         root_item_id: &str,
     ) -> Result<ListDatagenEventsResponse, ClientError> {
-        let resp = self
-            .http
-            .get(self.url(&format!("/datagen/{}/roots/{}/events", name, root_item_id)))
-            .send()
-            .await?;
+        self.datagen_events(name, "roots", root_item_id).await
+    }
+
+    async fn datagen_events(
+        &self,
+        name: &str,
+        scope: &str,
+        id: &str,
+    ) -> Result<ListDatagenEventsResponse, ClientError> {
+        let mut request = self.http.get(self.url("/datagen")).build()?;
+        // IDs can contain fan-out slashes and URL delimiters; each is one path segment.
+        request
+            .url_mut()
+            .path_segments_mut()
+            .expect("HTTP URL has path segments")
+            .extend([name, scope, id, "events"]);
+        let resp = self.http.execute(request).await?;
         Self::handle_response(resp).await
     }
 
